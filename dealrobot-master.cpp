@@ -19,7 +19,6 @@ const double TOTAL_DIR_LATED_FRAME = 2.0f; //转动的延时
 const int NUM_DIR_LATENCY_FRAMES = static_cast<int>(TOTAL_DIR_LATED_FRAME);
 const float DIR_LATENCY_FRACTION  = TOTAL_DIR_LATED_FRAME - static_cast<float>(NUM_DIR_LATENCY_FRAMES);
 
-const double Tolerant_Max_Error = 0.1;
 }
 
 CDealRobot::CDealRobot() {
@@ -32,18 +31,6 @@ CDealRobot::CDealRobot() {
     decidePossible = minBelieveFrame * upPossible;
     ourDownPossible = (1.0 - decidePossible) / ourMaxLostFrame;
     theirDownPossible = (1.0 - decidePossible) / theirMaxLostFrame;
-    initPosCov = 100; posMeasErr = 20; posModelErr = 0.2; 
-    timeStamp = 0;  
-    for (int id = 0; id < PARAM::ROBOTMAXID; id++) {
-        	posFilter[PARAM::BLUE][id] = PosFilter(initPosCov, posMeasErr, posModelErr);
-        	posFilter[PARAM::YELLOW][id] = PosFilter(initPosCov, posMeasErr, posModelErr);
-            //dirFilter[PARAM::BLUE][id] = PosFilter(initPosCov, posMeasErr, posModelErr);
-            //dirFilter[PARAM::YELLOW][id] = PosFilter(initPosCov, posMeasErr, posModelErr);
-            dirFilter[PARAM::BLUE][id] = DirFilter(initPosCov, posMeasErr, posModelErr);
-            dirFilter[PARAM::YELLOW][id] = DirFilter(initPosCov, posMeasErr, posModelErr);
-    }
-    result.init(); 
-    GlobalData::instance()->maintain.push(result);
 }
 
 double CDealRobot::posDist(CGeoPoint pos1, CGeoPoint pos2) {
@@ -177,23 +164,14 @@ void CDealRobot::sortRobot(int color) {
                 if ((isOnField(result.robot[color][i].pos)) &&
                         (GlobalData::instance()->robotPossible[color][id] < decidePossible
                          || result.robot[color][i].pos.dist(lastRobot[color][id].pos) < DIFF_VECHILE_MAX_DIFF)) {
-                    //result.robot[color][i].velocity = lastRobot[color][id].velocity;
-                    //result.robot[color][i].accelerate = lastRobot[color][id].accelerate;
-                    //result.robot[color][i].rotateVel = lastRobot[color][id].rotateVel;
                     lastRobot[color][id] = result.robot[color][i];
                     found = true;
                 }
             }
-        lastRobot[color][id].velocity = GlobalData::instance()->maintain[0].robot[color][id].velocity;
-        lastRobot[color][id].accelerate = GlobalData::instance()->maintain[0].robot[color][id].accelerate;
-        lastRobot[color][id].rotateVel = GlobalData::instance()->maintain[0].robot[color][id].rotateVel;
-        
         if (found)  GlobalData::instance()->robotPossible[color][id] += upPossible;
         else { // 没看到车，猜测一个原始位置//
-        	lastRobot[color][id].setPos(GlobalData::instance()->maintain[0].robot[color][id].pos + lastRobot[color][id].velocity / ZSS::Athena::FRAME_RATE);
-        	lastRobot[color][id].angle = GlobalData::instance()->maintain[0].robot[color][id].angle + lastRobot[color][id].rotateVel / ZSS::Athena::FRAME_RATE;
-            //lastRobot[color][id].setPos(lastRobot[color][id].pos + lastRobot[color][id].velocity / ZSS::Athena::FRAME_RATE);
-            //lastRobot[color][id].angle = lastRobot[color][id].angle + lastRobot[color][id].rotateVel / ZSS::Athena::FRAME_RATE;
+            lastRobot[color][id].setPos(lastRobot[color][id].pos + lastRobot[color][id].velocity / ZSS::Athena::FRAME_RATE);
+            lastRobot[color][id].angle = lastRobot[color][id].angle + lastRobot[color][id].rotateVel / ZSS::Athena::FRAME_RATE;
             if (GlobalData::instance()->robotPossible[color][id] >= decidePossible)
                 if (GlobalData::instance()->commandMissingFrame[color] >= 20)
                     GlobalData::instance()->robotPossible[color][id] -= theirDownPossible;
@@ -224,134 +202,80 @@ void CDealRobot::sortRobot(int color) {
     }
 }
 
-CGeoPoint CDealRobot::adjustPos(int team, int id, CGeoPoint point, double angle) {
-    if (abs(GlobalData::instance()->robotCommand[team][0].robotSpeed[id].vx) > 0.001
-                || abs(GlobalData::instance()->robotCommand[team][0].robotSpeed[id].vy) > 0.001) {
-            //小数部分
-            auto command = GlobalData::instance()->robotCommand[team][0 - NUM_MOV_LATENCY_FRAMES].robotSpeed[id];
-            CVector robot_travel = CVector(command.vx, -command.vy) * MOV_LATENCY_FRACTION / double(ZSS::Athena::FRAME_RATE);
-
-            //整数部分
-            for (int frame = NUM_MOV_LATENCY_FRAMES - 1; frame >= 0; frame--) {
-                command = GlobalData::instance()->robotCommand[team][0 - frame].robotSpeed[id];
-                robot_travel = robot_travel + CVector(command.vx * 10, -command.vy * 10) / ZSS::Athena::FRAME_RATE;
-            }
-
-            robot_travel = robot_travel.rotate(angle);
-            return (point + robot_travel);
-    }
-    else return point;
-}
-
 void CDealRobot::updateVel(int team, ReceiveVisionMessage& result) {
-    if(team == 0) timeStamp += 1 / ZSS::Athena::FRAME_RATE;
     for (int i = 0; i < validNum[team]; i++) {
         Robot & robot = result.robot[team][i];
-//        bool side;
+        //位置滤波
+        auto & playerPosVel = _kalmanFilter[team][robot.id].update(robot.pos.x(), robot.pos.y());
+        CGeoPoint filtPoint (playerPosVel(0, 0), playerPosVel(1, 0));
+        CVector PlayVel(playerPosVel(2, 0), playerPosVel(3, 0));
+
+        bool side;
         //朝向滤波
-        auto &playerRotVel = dirFilter[team][robot.id];
-        if(!playerRotVel.isInit()) {
-            playerRotVel.initState(robot.angle, robot.rotateVel);
-        }
-        double Rotdt = timeStamp - playerRotVel.lastTimestamp;
-        playerRotVel.lastTimestamp = timeStamp;
-        playerRotVel.setTransitionMat(Rotdt);
-        //playerPosVel.predict2(lastRobot[team][robot.id].accelerate);
-        playerRotVel.predict();
-        playerRotVel.update2(robot.angle);
-
-        double filterDir = playerRotVel.postEstimatedDir();
-        double rotVel = playerRotVel.postEstimatedVel();
-
-        robot.angle = filterDir;
-        //robot.angle = playerRotVel.normalize(robot.angle);
-        //playerRotVel.set(0, robot.angle);
-        robot.rotateVel = rotVel;
-        /**auto &playerRotVel = dirFilter[team][robot.id].update(std::cos(robot.angle), std::sin(robot.angle));
+        auto &playerRotVel = _dirFilter[team][robot.id].update(std::cos(robot.angle), std::sin(robot.angle));
         double filterDir = std::atan2(playerRotVel(1, 0), playerRotVel(0, 0));
         double rotVel = playerRotVel(2, 0) * std::cos(90 * 3.1416 / 180 + filterDir)
                         + playerRotVel(3, 0) * std::sin(90 * 3.1416 / 180 + filterDir);
 
-        if (abs(GlobalData::instance()->robotCommand[team][0].robotSpeed[robot.id].vr) > 0.001) {
-            //小数部分
-            auto command = GlobalData::instance()->robotCommand[team][0 - NUM_MOV_LATENCY_FRAMES].robotSpeed[robot.id];
-            robot.angle += - command.vr * DIR_LATENCY_FRACTION / ZSS::Athena::FRAME_RATE;
-            //整数部分
-            for (int frame = NUM_DIR_LATENCY_FRAMES - 1; frame >= 0 ; frame--) {
-                command = GlobalData::instance()->robotCommand[team][0 - frame].robotSpeed[robot.id];
-                robot.angle += - command.vr  / ZSS::Athena::FRAME_RATE;
-            }
-            robot.rotateVel = - command.vr;
-            //qDebug()<<"robot.angle"<<robot.angle;
-        }
-        else {
-            robot.angle = filterDir;
-            //qDebug()<<"angle"<<robot.angle;
-            robot.rotateVel = rotVel;
-            //robot.rotateVel = rotVel * ZSS::Athena::FRAME_RATE;
-        }**/
-
-        //位置滤波
-        auto & playerPosVel = posFilter[team][robot.id];
-        if(!playerPosVel.isInit()) {
-            playerPosVel.initState(robot.pos, CVector(robot.velocity));
-        }
-        //CGeoPoint filtPoint = playerPosVel.postEstimatedPos();
-        //qDebug()<<"filtPoint"<<filtPoint.x()<<filtPoint.y();
-        double Posdt = timeStamp - playerPosVel.lastTimestamp;
-        playerPosVel.lastTimestamp = timeStamp;
-//        if(team==0&&robot.id==0){
-//            qDebug()<<"team"<<team<<"id"<<robot.id<<"dt"<<dt;
-//        }
-        playerPosVel.setTransitionMat(Posdt);
-        //playerPosVel.predict2(lastRobot[team][robot.id].accelerate);
-        playerPosVel.predict();
-        playerPosVel.update2(robot.pos);
-        
-        /**if(hasError(robot.pos.x(), playerPosVel.postEstimatedPos().x())) {
-            qDebug()<<"Error_x";
-            playerPosVel.set(0, adjustPos(team, robot.id, robot.pos, robot.angle).x());
-            //playerPosVel.set(0, robot.pos.x());
-            //playerPosVel.set(0, robot.pos.x() + GlobalData::instance()->robotCommand[team][0].robotSpeed[robot.id].vx / ZSS::Athena::FRAME_RATE);
-            //playerPosVel.set(0, playerPosVel.postEstimatedPos().x() + GlobalData::instance()->robotCommand[team][0].robotSpeed[robot.id].vx * dt);
-            playerPosVel.set(2, GlobalData::instance()->robotCommand[team][0].robotSpeed[robot.id].vx);
-        }
-        if(hasError(robot.pos.y(), playerPosVel.postEstimatedPos().y())) {
-            qDebug()<<"Error_y";
-            playerPosVel.set(1, adjustPos(team, robot.id, robot.pos, robot.angle).y());
-            //playerPosVel.set(1, robot.pos.y());
-            //playerPosVel.set(1, robot.pos.y() - GlobalData::instance()->robotCommand[team][0].robotSpeed[robot.id].vy / ZSS::Athena::FRAME_RATE);
-            //playerPosVel.set(0, playerPosVel.postEstimatedPos().y() - GlobalData::instance()->robotCommand[team][0].robotSpeed[robot.id].vy * dt);
-            playerPosVel.set(3, -GlobalData::instance()->robotCommand[team][0].robotSpeed[robot.id].vy);
-        }**/
-
-        CGeoPoint filtPoint = playerPosVel.postEstimatedPos();
-        CVector PlayVel = playerPosVel.postEstimatedVel();
-
-        //ZSS::ZParamManager::instance()->loadParam(side, "ZAlert/IsRight");
+        robot.angle = filterDir;
+        robot.rotateVel = rotVel * ZSS::Athena::FRAME_RATE;
+        ZSS::ZParamManager::instance()->loadParam(side, "ZAlert/IsRight");
         robot.pos = filtPoint;
-        robot.velocity = PlayVel;
-        robot.velocity = robot.velocity.rotate(robot.angle);
-        playerPosVel.set(2, robot.velocity.x());
-        playerPosVel.set(3, robot.velocity.y());
-        //robot.velocity = PlayVel * ZSS::Athena::FRAME_RATE;
-        robot.accelerate = (robot.velocity - lastRobot[team][robot.id].velocity) / Posdt;
-        //robot.accelerate = robot.accelerate.rotate(robot.angle);
-        //robot.accelerate = (robot.velocity - GlobalData::instance()->maintain[-2].robot[team][robot.id].velocity) / 3 * ZSS::Athena::FRAME_RATE ;
-        //robot.accelerate = (robot.velocity - GlobalData::instance()->maintain[0].robot[team][robot.id].velocity) * ZSS::Athena::FRAME_RATE ;
-        if(robot.accelerate.mod()>7000) robot.accelerate=CVector(std::cos(robot.angle), std::sin(robot.angle))*7000;
-        else if(robot.accelerate.mod()<-7000) robot.accelerate=CVector(std::cos(robot.angle), std::sin(robot.angle))*(-7000); 
+        robot.velocity = PlayVel * ZSS::Athena::FRAME_RATE;
 
-        /**if(team==0&&robot.id==0){
+        if(team==0&&robot.id==0){
             qDebug()<<"team"<<team<<"id"<<robot.id<<"pos"<<robot.pos.x()<<robot.pos.y();
             qDebug()<<"vel"<<robot.velocity.x()<<robot.velocity.y();
             //qDebug()<<"acc"<<robot.accelerate.x()<<robot.accelerate.y();
             //qDebug()<<"maintain"<<GlobalData::instance()->maintain[0].robot[team][robot.id].velocity.x()<<GlobalData::instance()->maintain[0].robot[team][robot.id].velocity.y();
             qDebug()<<"command"<<GlobalData::instance()->robotCommand[team][0].robotSpeed[robot.id].vx<<GlobalData::instance()->robotCommand[team][0].robotSpeed[robot.id].vy;
-        }**/
+        }
 
+        //我方位置朝向修正，根据medusa回传的速度信息
+        if (abs(GlobalData::instance()->robotCommand[team][0].robotSpeed[robot.id].vx) > 0.001
+                || abs(GlobalData::instance()->robotCommand[team][0].robotSpeed[robot.id].vy) > 0.001
+                || abs(GlobalData::instance()->robotCommand[team][0].robotSpeed[robot.id].vr) > 0.001) {
+            //小数部分
+            auto command = GlobalData::instance()->robotCommand[team][0 - NUM_MOV_LATENCY_FRAMES].robotSpeed[robot.id];
+            CVector robot_travel = CVector(command.vx * 10, -command.vy * 10) * MOV_LATENCY_FRACTION / double(ZSS::Athena::FRAME_RATE);
+
+            robot.angle += - command.vr * DIR_LATENCY_FRACTION / ZSS::Athena::FRAME_RATE ;
+//            robot.velocity = robot.velocity.rotate(robot.angle);
+//            robot.pos = robot.pos + robot.velocity * MOV_LATENCY_FRACTION / ZSS::Athena::FRAME_RATE;
+            //整数部分
+            for (int frame = NUM_MOV_LATENCY_FRAMES - 1; frame >= 0; frame--) {
+                command = GlobalData::instance()->robotCommand[team][0 - frame].robotSpeed[robot.id];
+                robot_travel = robot_travel + CVector(command.vx * 10, -command.vy * 10) / ZSS::Athena::FRAME_RATE;
+//                robot.pos = robot.pos + robot.velocity / ZSS::Athena::FRAME_RATE;
+//                qDebug() << "after" << robot.pos.x() << " " << robot.pos.y();
+            }
+            for (int frame = NUM_DIR_LATENCY_FRAMES - 1; frame >= 0 ; frame--) {
+                command = GlobalData::instance()->robotCommand[team][0 - frame].robotSpeed[robot.id];
+                robot.angle += - command.vr  / ZSS::Athena::FRAME_RATE ;
+                //            robot.velocity = robot.velocity.rotate(robot.angle);
+//                qDebug() << "after" << robot.pos.x() << " " << robot.pos.y();
+            }
+
+            robot_travel = robot_travel.rotate(robot.angle);
+            robot.pos = robot.pos + robot_travel;
+            robot.rotateVel = - command.vr;
+            robot.velocity = CVector( GlobalData::instance()->robotCommand[team][0].robotSpeed[robot.id].vx * 10,
+                                      -GlobalData::instance()->robotCommand[team][0].robotSpeed[robot.id].vy * 10);
+            robot.velocity = robot.velocity.rotate(robot.angle);
+            if (robot.velocity.mod() > 10000)
+                qDebug() << "fuck!!!" << robot.velocity.mod();
+            //FIX IT
+
+        }
+
+        for (int j = 0; j < PARAM::ROBOTNUM; j++) {
+            if (robot.id == GlobalData::instance()->maintain[0].robot[team][j].id ) {
+
+                robot.accelerate = (robot.velocity - GlobalData::instance()->maintain[-2].robot[team][j].velocity) / 3 * ZSS::Athena::FRAME_RATE ;
+//                if (abs(robot.accelerate.mod()) > 600) robot.accelerate = CVector(0, 0);
+            }
+        }
         lastRobot[team][robot.id].velocity = robot.velocity;
-        lastRobot[team][robot.id].accelerate = robot.accelerate;
         lastRobot[team][robot.id].rotateVel = robot.rotateVel;
     }
 }
